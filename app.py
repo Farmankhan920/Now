@@ -13,6 +13,8 @@ import json
 import os
 import re
 import secrets
+import socket
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -179,6 +181,7 @@ def resolve_youtube(url, quality, cookie_text=""):
 TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 STALL_SECONDS = 60   # no media progress for this long -> restart ffmpeg
 MAX_FAILS = 30       # consecutive failed attempts before giving up
+OUT_FAIL_LIMIT = 8   # consecutive 'destination refused us' failures before giving up
 
 
 def is_running():
@@ -204,6 +207,31 @@ def probe_duration(url):
         return int(float(out))
     except Exception:
         return 0
+
+
+def diagnose(output):
+    """Say why the destination can't be reached: DNS, TCP, TLS, or the server itself refusing."""
+    p = urlparse(output)
+    host, port = p.hostname, p.port
+    try:
+        ip = socket.gethostbyname(host)
+    except OSError as e:
+        return f"[check] DNS lookup for {host} failed ({e}). The stream URL looks wrong."
+    try:
+        sock = socket.create_connection((host, port), timeout=8)
+    except OSError as e:
+        return f"[check] {host} resolved ({ip}) but port {port} is unreachable ({e})."
+    if p.scheme != "rtmps":
+        sock.close()
+        return f"[check] DNS and TCP to {host}:{port} are fine, so the server itself refused the stream."
+    try:
+        with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as t:
+            ver = t.version()
+        return (f"[check] DNS, TCP and TLS ({ver}) to {host}:{port} all work, so the platform "
+                "itself is refusing the stream. Usually the key or URL is expired or wrong, or "
+                "the platform isn't waiting for a stream yet.")
+    except (ssl.SSLError, OSError) as e:
+        return f"[check] TLS handshake with {host}:{port} failed ({e})."
 
 
 def normalize_stream_url(url):
@@ -257,6 +285,8 @@ def pump_logs(job, proc, base, run):
                 run["last_t"], run["beat"] = t, time.time()
             state["progress"] = line
         else:
+            if "Error opening output" in line:
+                run["out_fail"] = True
             log(line)
 
 
@@ -279,7 +309,7 @@ def resume_point(job, src):
 
 def supervise(job, src):
     """Run ffmpeg and keep it running: if it drops or stalls, resume where it left off."""
-    fails, first, rc = 0, True, None
+    fails, out_fails, first, rc = 0, 0, True, None
     try:
         while not job["stop"]:
             if not first:
@@ -332,6 +362,18 @@ def supervise(job, src):
             if complete:
                 log("[finished: the video played to the end]")
                 break
+
+            if run.get("out_fail"):
+                out_fails += 1
+                if out_fails in (1, 4):
+                    log(diagnose(job["output"]))
+                if out_fails >= OUT_FAIL_LIMIT:
+                    log("[the destination keeps refusing the connection, so I stopped. "
+                        "Get a fresh URL and key from the platform, wait for it to say it is "
+                        "ready, then press Run again]")
+                    break
+            else:
+                out_fails = 0
 
             fails = 0 if run["last_t"] >= 20 else fails + 1
             if fails > MAX_FAILS:
