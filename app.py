@@ -40,6 +40,8 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Sa
 TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 KEEP_RE = re.compile(r"error|fail|refus|timed? ?out|invalid|unable|denied|reset|broken|not found|"
                      r"server|reconnect|warning|exit|^Input #0|^Output #0", re.I)
+SRC_ERR_RE = re.compile(r"HTTP error 4|Server returned 4|Forbidden|Not Found|\b40[34]\b|\b410\b", re.I)
+ERR_RE = re.compile(r"error|fail|refus|timed? ?out|reset|broken|denied", re.I)
 STALL_SECONDS = 60   # no media progress for this long -> restart ffmpeg
 MAX_FAILS = 30       # consecutive failed attempts before giving up
 OUT_FAIL_LIMIT = 8   # consecutive "destination refused us" failures before giving up
@@ -264,7 +266,7 @@ def build_cmd(src, output, loop, start_at=0.0):
                 "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-f", "flv", output]
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info"]
     for url in src["urls"]:
-        cmd += ["-user_agent", src["ua"],
+        cmd += ["-user_agent", src["ua"], "-thread_queue_size", "512",
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
         if start_at > 0 and not src["live"]:
             cmd += ["-ss", f"{start_at:.2f}"]
@@ -297,6 +299,10 @@ def pump_logs(job, proc, base, run):
         else:
             if "Error opening output" in line:
                 run["out_fail"] = True
+            if SRC_ERR_RE.search(line):
+                run["src_err"] = True
+            if ERR_RE.search(line):
+                run["last_err"] = line[:160]
             if KEEP_RE.search(line):
                 log(line, job)
 
@@ -320,11 +326,12 @@ def resume_point(job, src):
 
 def supervise(job, src):
     """Run ffmpeg for one destination and keep it running: if it drops or stalls, resume."""
-    fails, out_fails, first, rc = 0, 0, True, None
+    fails, out_fails, first, rc, reuse = 0, 0, True, None, False
     try:
         while not job["stop"]:
             if not first:
                 job["phase"] = "reconnecting"
+            if not first and not reuse:
                 try:
                     src = resolve_source(job)
                 except ValueError as e:
@@ -391,7 +398,11 @@ def supervise(job, src):
                 break
             wait = min(2 + 3 * fails, 30)
             job["restarts"] += 1
-            log(f"[stream dropped (code {rc}); resuming from {hms(job['pos'])} in {wait}s]", job)
+            # Streamed fine for a while and the video link isn't the problem: reconnect at once
+            # with the same links, so the platform keeps treating it as one continuous stream.
+            reuse = run["last_t"] >= 5 and not run.get("src_err")
+            why = f": {run['last_err']}" if run.get("last_err") else ""
+            log(f"[stream dropped (code {rc}){why}; reconnecting from {hms(job['pos'])} in {wait}s]", job)
             nap(job, wait)
     except Exception as e:  # never let a supervisor die silently
         log(f"[supervisor error: {e}]", job)
