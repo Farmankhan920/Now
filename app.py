@@ -843,6 +843,7 @@ INDEX_HTML = r"""<!doctype html>
         <button type="button" class="chip" data-name="Facebook" data-url="rtmps://live-api-s.facebook.com:443/rtmp/">Facebook</button>
         <button type="button" class="chip" data-name="Twitch" data-url="rtmp://live.twitch.tv/app">Twitch</button>
         <button type="button" class="chip" data-name="Kick" data-url="rtmps://fa723fc1b171.global-contribute.live-video.net:443/app">Kick</button>
+        <button type="button" class="chip" data-name="Rumble" data-url="rtmp://rtmp.rumble.com/live">Rumble</button>
       </div>
       <div class="field">
         <label class="f" for="p_name">Platform name</label>
