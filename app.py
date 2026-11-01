@@ -245,7 +245,18 @@ def normalize_stream_url(url):
     return f"{p.scheme}://{host}:{port}{path}"
 
 
+TEST_SRC = {"test": True, "urls": [], "live": True, "ua": UA,
+            "title": "Test pattern (30 seconds)", "duration": 0}
+
+
 def build_cmd(src, output, loop, start_at=0.0):
+    if src.get("test"):  # small colour-bars + tone, to check the destination accepts us
+        return ["ffmpeg", "-hide_banner", "-loglevel", "info",
+                "-re", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=15",
+                "-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
+                "-t", "30", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                "-g", "30", "-pix_fmt", "yuv420p", "-b:v", "600k",
+                "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-f", "flv", output]
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info"]
     for url in src["urls"]:
         cmd += ["-user_agent", src["ua"],
@@ -266,6 +277,8 @@ def build_cmd(src, output, loop, start_at=0.0):
 
 
 def resolve_source(job):
+    if job["kind"] == "test":
+        return dict(TEST_SRC)
     if job["kind"] == "drive":
         return resolve_drive(job["video_url"])
     return resolve_youtube(job["video_url"], job["quality"], job["cookies"])
@@ -432,8 +445,9 @@ def start():
     stream_key = (d.get("stream_key") or "").strip()
     quality = d.get("quality") or "1080"
     loop = bool(d.get("loop"))
+    test = bool(d.get("test"))
 
-    if not (video_url and stream_url and stream_key):
+    if not (stream_url and stream_key and (video_url or test)):
         return jsonify(error="Fill in the video link, stream URL and stream key."), 400
     if not stream_url.startswith(("rtmp://", "rtmps://")):
         return jsonify(error="Stream URL must start with rtmp:// or rtmps://"), 400
@@ -442,10 +456,13 @@ def start():
     stream_url = normalize_stream_url(stream_url)
 
     try:
-        kind = detect_source(video_url)
         cookies = d.get("cookies") or ""
-        src = (resolve_drive(video_url) if kind == "drive"
-               else resolve_youtube(video_url, quality, cookies))
+        if test:
+            kind, src = "test", dict(TEST_SRC)
+        else:
+            kind = detect_source(video_url)
+            src = (resolve_drive(video_url) if kind == "drive"
+                   else resolve_youtube(video_url, quality, cookies))
     except NeedCookies as e:
         return jsonify(error=str(e), need_cookies=True), 400
     except ValueError as e:
@@ -627,6 +644,7 @@ INDEX_HTML = r"""<!doctype html>
   .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
   .mini { font: inherit; font-size: .85rem; font-weight: 500; padding: 8px 16px; border-radius: 999px; cursor: pointer;
     color: var(--text); background: rgba(255,255,255,.08); border: 1px solid var(--stroke); }
+  .mini:disabled { opacity: .4; cursor: not-allowed; }
   .mini:hover { background: rgba(255,51,102,.22); border-color: var(--hot); }
   .steps { color: var(--muted); font-size: .88rem; margin: 0 0 14px; padding-left: 20px; }
   .steps li { margin-bottom: 4px; }
@@ -727,6 +745,7 @@ INDEX_HTML = r"""<!doctype html>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>
           </button>
         </div>
+        <button type="button" class="mini" id="testBtn" style="margin-top:16px">Send a 30-second test pattern</button>
       </section>
     </div>
 
@@ -785,10 +804,10 @@ async function refresh() {
     running = r.running; uptime = r.uptime; fetchedAt = Date.now();
     $("root").classList.toggle("live", r.running);
     $("state").textContent = r.running ? "ON AIR" : "OFFLINE";
-    $("run").disabled = r.running; $("stop").disabled = !r.running;
+    $("run").disabled = r.running; $("stop").disabled = !r.running; $("testBtn").disabled = r.running;
     $("nowLabel").textContent = r.running ? "Now streaming" : (r.exit_code !== null && r.title ? "Last stream ended" : "Nothing is streaming");
     $("nowTitle").textContent = r.title || "Ready when you are";
-    const src = r.source === "youtube" ? "YouTube" : "Google Drive";
+    const src = { youtube: "YouTube", drive: "Google Drive", test: "the test pattern" }[r.source] || "";
     $("pillText").textContent = !r.running ? "Server idle"
       : (r.phase === "reconnecting" ? "Reconnecting to " + src : "Live from " + src)
         + (r.restarts ? ", resumed " + r.restarts + (r.restarts === 1 ? " time" : " times") : "");
@@ -876,6 +895,19 @@ $("form").addEventListener("submit", async e => {
       toast(data.error || "Couldn’t start the stream.", "err");
       if (data.need_cookies) { $("cookieBox").open = true; $("cookieBox").scrollIntoView({ behavior: "smooth", block: "center" }); }
     }
+  } catch (err) { toast("Couldn’t reach the server.", "err"); }
+  refresh();
+});
+
+$("testBtn").addEventListener("click", async () => {
+  if (!$("stream_url").value.trim() || !$("stream_key").value.trim()) { toast("Fill in the Stream URL and key first.", "err"); return; }
+  toast("Sending a 30-second test pattern…");
+  try {
+    const res = await fetch("/start", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ test: true, stream_url: $("stream_url").value, stream_key: $("stream_key").value }) });
+    const data = await res.json();
+    if (res.ok) toast("Test started. Look at the destination’s preview now.", "ok");
+    else toast(data.error || "Couldn’t start the test.", "err");
   } catch (err) { toast("Couldn’t reach the server.", "err"); }
   refresh();
 });
