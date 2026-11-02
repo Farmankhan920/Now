@@ -301,6 +301,8 @@ def pump_logs(job, proc, base, run):
                 run["out_fail"] = True
             if SRC_ERR_RE.search(line):
                 run["src_err"] = True
+            if "429" in line:
+                run["rate_limited"] = True
             if ERR_RE.search(line):
                 run["last_err"] = line[:160]
             if KEEP_RE.search(line):
@@ -368,10 +370,20 @@ def supervise(job, src):
             if job["stop"]:
                 break
 
+            fresh = None
             if job["loop"]:
                 complete = False
             elif src["live"]:
-                complete = rc == 0
+                # ffmpeg also exits cleanly (code 0) when YouTube stops answering the live
+                # playlist (e.g. HTTP 429), so a clean exit does NOT mean the live ended.
+                # Ask YouTube again: only finish if the broadcast is really not live anymore.
+                complete = False
+                if rc == 0:
+                    try:
+                        fresh = resolve_source(job)
+                        complete = not fresh["live"]
+                    except ValueError:
+                        fresh = None  # can't tell: assume it is still live and retry
             elif dur:
                 complete = job["pos"] >= dur - 8
             else:
@@ -397,10 +409,14 @@ def supervise(job, src):
                 log("[giving up after repeated failures]", job)
                 break
             wait = min(2 + 3 * fails, 30)
+            if run.get("rate_limited"):
+                wait = max(wait, 30)  # YouTube said "too many requests": back off before retrying
             job["restarts"] += 1
             # Streamed fine for a while and the video link isn't the problem: reconnect at once
             # with the same links, so the platform keeps treating it as one continuous stream.
             reuse = run["last_t"] >= 5 and not run.get("src_err")
+            if fresh and fresh["live"]:
+                src, reuse = fresh, True  # already re-resolved above, still live: use the new link
             why = f": {run['last_err']}" if run.get("last_err") else ""
             log(f"[stream dropped (code {rc}){why}; reconnecting from {hms(job['pos'])} in {wait}s]", job)
             nap(job, wait)
